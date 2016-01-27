@@ -1,121 +1,278 @@
+require 'time'
 require 'digest/sha1'
-require 'date'
 
-class Branch
-  attr_accessor :commits
-  def initialize(name = :master)
-    @name = name
-    @commits = {}
-  end
-
-  def create(branch_name)
-    Branch.new(branch_name)
-    repository[branch_name] = @commits
-  end
-
-  def check(check_branches, check_current, branch_name)
-    message = "Branch #{branch_name} does not exist."
-    if check_branches == true and check_current == false
-      repository.delete(branch_name)
-      Objects.new(branch_name, "",true, "Removed branch #{branch_name}")
-    elsif check_branches and check_current
-      Objects.new(branch_name, "", false, "Cannot remove current branch.")
-    else Objects.new(branch_name, "", false, message)
+module ObjectStore
+  class << self
+    def init(&block)
+      repository = Repository.new
+      return repository unless block_given?
+      repository.instance_eval(&block)
+      repository
     end
   end
 
-  def remove(branch_name)
-    check_branches = repository.include?(branch_name)
-    check_current = branch_name.eql?(current)
-    check(check_branches, check_current, branch_name)
-  end
-end
+  class Value
+    attr_accessor :message, :result
 
-class ObjectStore < Branch
-  attr_accessor :repository, :current
-  def initialize
-    @repository = {}
-    @current = Branch.new
-  end
+    def initialize(message, success: true, result: nil)
+      @message = message
+      @success = success
+      @error = !success
+      @result = result
+    end
 
-  def self.init(&block)
-    new_repository = ObjectStore.new
-    if block_given?
-      new_repository.instance_eval &block
-    else new_repository
+    def success?
+      @success
+    end
+
+    def error?
+      @error
     end
   end
 
-  def add(name, object)
-    changes[name] = object
-    message = "Added #{name} to stage."
-    Objects.new(name, object, true, message)
-  end
+  class Repository
+    class Commit
+      attr_accessor :commit_files, :hash, :message, :date
+      TIME = "%a %b %d %H:%M %Y %z"
 
-  def branch
-    @current
-  end
+      def initialize(files, message)
+        @hash = hash
+        @commit_files = files
+        @message = message
+        @date = Time.new
+      end
 
-  def commit(message)
-    commits[Digest::SHA1.hexdigest(message)] = changes
-    if changes.size == 0
-      text = "Nothing to commit, working directory clean."
-      Objects.new("", "", false, text)
-    else text = "#{message}" + '\n' + '\t' + "#{commits.size} objects changed"
-      Objects.new("", "", true, text)
-   end
-  end
+      def objects
+        @commit_files.values
+      end
 
-  def remove(name)
-    result = changes.delete(name) {"not found"}
-    if result.eql?("not found")
-      message = "Object #{name} is not committed."
-      Objects.new(name, "", false, message)
-    else message = "Added #{name} for removal."
-      Objects.new(name, "", true, message)
+      def to_s
+        "Commit #{@hash}\nDate: #{date.strftime(TIME)}\n\n\t#{@message}"
+      end
     end
-  end
 
-  def checkout(commit_hash)
-    message = "Commit #{commit_hash} does not exist."
-    if commits.include?(commit_hash)
-      Objects.new(commit_hash, "", true, "HEAD is now at #{commit_hash}.")
-    else Objects.new(commit_hash, "", false, message)
+    class Branch
+      attr_accessor :added, :removed, :changed, :commits, :name
+      TIME = "%a %b %d %H:%M %Y %z"
+
+      def initialize(name, commits = [])
+        @name = name
+        @commits = commits
+      end
+
+      def remove_file(name)
+        removed = @commits.last.commit_files[name]
+        Value.new("Added #{name} for removal.", result: removed)
+      end
+
+      def new_commit(message, commit_files, changed_files)
+        @commits << Commit.new(commit_files, message)
+        hash = Digest::SHA1.hexdigest(@commits.last.date
+                                    .strftime(TIME) + message)
+        @commits.last.hash = hash
+        Value.new("#{message}\n\t#{changed_files} objects changed",
+                                                result: @commits.last)
+      end
+
+      def checkout(hash)
+        index = @commits.index{ |x| x.hash == hash }
+        if index.nil?
+          Value.new("Commit #{hash} does not exist.", success: false)
+        else
+          @commits = @commits.take(index + 1)
+          Value.new("HEAD is now at #{hash}.", result: @commits.last)
+        end
+      end
     end
-  end
-end
 
+    class Branches
 
+      attr_reader :current, :branches
+      def initialize
+        @current = Branch.new("master")
+        @branches = { "master": @current }
+        @added = {}
+        @removed = {}
+        @changed = 0
+      end
 
-class Objects
-  def initialize(name, object, state, message)
-    @name = name
-    @object = object
-    @state = state
-    @message = message
-   end
+      def add(name, object)
+        @changed += 1 unless @added.key?(name)
+        @added[name] = object
+        Value.new("Added #{name} to stage.", result: object)
+      end
 
-  def message
-    @message
-  end
+      def clean
+        @added = {}
+        @removed = []
+        @changed = 0
+      end
 
-  def success?
-    @state == true
-  end
+      def add_removed_changed(name)
+        @removed.push(name)
+        @changed += 1
+      end
 
-  def error?
-    @state == false
-  end
+      def make_commits
+        if @current.commits.empty?
+          data = @added
+        else
+          data = @current.commits.last.commit_files.merge(@added)
+        end
+        data.delete_if{ |key, value| @removed.member?(key) }
+      end
 
-  def result
-    @object
-  end
-end
+      def commit(message)
+        if @changed == 0
+          Value.new("Nothing to commit, working directory clean.",
+                            success: false)
+        else make_result(message)
+        end
+      end
 
-class Commit
-  attr_accessor :changes
-  def initialize(message)
-    @message = message
-    @changes = {}
+      def make_result(message)
+        result = @current.new_commit(message,
+                                        make_commits,
+                                        @changed)
+        clean
+        result
+      end
+
+      def remove_in_added_files(name)
+         removed = @added.delete(name)
+         add_removed_changed(name)
+         Value.new("Added #{name} for removal.", result: removed)
+      end
+
+      def remove_in_branch(name)
+        add_removed_changed(name)
+        @current.remove_file(name)
+      end
+
+      def remove_file(name)
+        has_commits = head.success?
+        if has_commits and @current.commits.last.commit_files.
+                                                      has_key?(name)
+          remove_in_branch(name)
+        else Value.new("Object #{name} is not committed.", success: false)
+        end
+      end
+
+      def checkout_hash(hash)
+        @current.checkout(hash)
+      end
+
+      def create(branch_name)
+        if @branches.has_key?(branch_name.to_sym)
+          Value.new("Branch #{branch_name} already exists.", success: false)
+        else
+          new_branch = Branch.new(branch_name, @current.commits.clone)
+          @branches[branch_name.to_sym] = new_branch
+          Value.new("Created branch #{branch_name}.", result: new_branch)
+        end
+      end
+
+      def checkout(branch_name)
+        if @branches.has_key?(branch_name.to_sym)
+          @current = @branches[branch_name.to_sym]
+          Value.new("Switched to branch #{branch_name}.",
+                    result: @current)
+        else
+          Value.new("Branch #{branch_name} does not exist.", success: false)
+        end
+      end
+
+      def remove(branch_name)
+        if not @branches.has_key?(branch_name.to_sym)
+          Value.new("Branch #{branch_name} does not exist.",
+                     success: false)
+        elsif @current.name.to_sym == branch_name.to_sym
+          Value.new("Cannot remove current branch.", success: false)
+        else
+          Value.new("Removed branch #{branch_name}.",
+                     result: @branches.delete(branch_name.to_sym))
+        end
+      end
+
+      def list
+        names = @branches.keys.map(&:to_s).sort
+        result = names.reduce("") do |message, name|
+          if name == @current.name
+            message += "\n* " + name
+          else
+            message += "\n  " + name
+          end
+        end
+        Value.new(result[1..-1])
+      end
+
+      def log
+        if @current.commits.empty?
+          Value.new("Branch #{@current.name} does not have any commits yet.",
+                     success: false)
+        else
+          message = @current.commits.reverse.map(&:to_s).join("\n\n")
+          Value.new(message.strip)
+        end
+      end
+
+      def head
+        if @current.commits.empty?
+          Value.new("Branch #{@current.name} does not have any commits yet.",
+                     success: false)
+        else
+          last_commit = @current.commits.last
+          Value.new(last_commit.message, result: last_commit)
+        end
+      end
+
+      def get(name)
+        if @current.commits.empty? or
+            not @current.commits.last.commit_files.key?(name)
+          Value.new("Object #{name} is not committed.",
+                                    success: false)
+        else
+          Value.new("Found object #{name}.",
+                     result: @current.commits.last.commit_files[name])
+        end
+      end
+    end
+
+    attr_reader :branches
+    def initialize
+      @branches = Branches.new
+    end
+
+    def add(name, object)
+      @branches.add(name, object)
+    end
+
+    def commit(message)
+      @branches.commit(message)
+    end
+
+    def remove(name)
+      @branches.remove_file(name)
+    end
+
+    def checkout(hash)
+      @branches.checkout_hash(hash)
+    end
+
+    def branch
+      @branches
+    end
+
+    def log
+      @branches.log
+    end
+
+    def head
+      @branches.head
+    end
+
+    def get(name)
+      @branches.get(name)
+    end
   end
 end
